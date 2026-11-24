@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#PBS -N cardiac_rl
+#PBS -l select=1:ncpus=28:mem=240gb:ngpus=4
+#PBS -l place=excl
+#PBS -l walltime=168:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit qsub from the project root}"
+if [[ -f scripts/hpc/cluster.env ]]; then source scripts/hpc/cluster.env; fi
+if [[ -n "${HPC_MODULE_INIT:-}" ]]; then source "$HPC_MODULE_INIT"; fi
+PYTHON="$PWD/.venv/bin/python"
+CONFIG=${CONFIG:-configs/default.yaml}
+DATA_DIR=${DATA_DIR:-data/default}
+RUN_ROOT=${RUN_ROOT:-runs/default}
+SEED_START=${SEED_START:-0}
+RESUME=${RESUME:-0}
+TOTAL_STEPS=${TOTAL_STEPS:-300000}
+export OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/cardiac-mpl-${PBS_JOBID:-manual}"
+mkdir -p logs "$RUN_ROOT" "$MPLCONFIGDIR"
+"$PYTHON" -c 'import torch; assert torch.cuda.is_available(), "CUDA PyTorch/driver unavailable"; assert torch.cuda.device_count() >= 4, "Job must expose four allocated GPUs"; print(torch.__version__, [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])'
+
+# Prepare once before four processes load the same immutable data/grid files.
+"$PYTHON" -m cardiac_rl.cli prepare --config "$CONFIG" --data-dir "$DATA_DIR"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a GPU_DEVICES <<< "$CUDA_VISIBLE_DEVICES"
+else
+  GPU_DEVICES=(0 1 2 3)
+fi
+if (( ${#GPU_DEVICES[@]} < 4 )); then echo "Fewer than four GPU assignments" >&2; exit 2; fi
+PIDS=()
+interrupt_children() {
+  trap '' TERM INT USR1
+  for child in "${PIDS[@]}"; do kill -USR1 "$child" 2>/dev/null || true; done
+  for child in "${PIDS[@]}"; do wait "$child" 2>/dev/null || true; done
+  exit 75
+}
+trap interrupt_children TERM INT USR1
+for slot in 0 1 2 3; do
+  seed=$((SEED_START + slot))
+  train_args=(-m cardiac_rl.cli train --config "$CONFIG" --data-dir "$DATA_DIR" \
+    --output "$RUN_ROOT/seed_$seed" --seed "$seed" --device cuda:0 --steps "$TOTAL_STEPS")
+  if [[ "$RESUME" == 1 ]]; then train_args+=(--resume); fi
+  CUDA_VISIBLE_DEVICES="${GPU_DEVICES[$slot]}" "$PYTHON" "${train_args[@]}" \
+    > "logs/train_${PBS_JOBID:-manual}_seed_${seed}.log" 2>&1 &
+  PIDS+=("$!")
+done
+status=0
+for child in "${PIDS[@]}"; do
+  if wait "$child"; then :; else status=1; fi
+done
+if (( status != 0 )); then echo "Training failed/interrupted; inspect logs and resume." >&2; exit "$status"; fi
+
+# Evaluation is CPU-bound, so keep all four CPU allocations busy after training.
+PIDS=()
+for slot in 0 1 2 3; do
+  seed=$((SEED_START + slot))
+  "$PYTHON" -m cardiac_rl.cli evaluate --config "$CONFIG" --data-dir "$DATA_DIR" \
+    --output "$RUN_ROOT/seed_$seed" --seed "$seed" --backend "${EVAL_BACKEND:-grid}" \
+    > "logs/eval_${PBS_JOBID:-manual}_seed_${seed}.log" 2>&1 &
+  PIDS+=("$!")
+done
+status=0
+for child in "${PIDS[@]}"; do if wait "$child"; then :; else status=1; fi; done
+if (( status != 0 )); then echo "Evaluation failed; inspect logs." >&2; exit "$status"; fi
+"$PYTHON" -m cardiac_rl.cli aggregate --root "$RUN_ROOT" --output "$RUN_ROOT/aggregate.json"

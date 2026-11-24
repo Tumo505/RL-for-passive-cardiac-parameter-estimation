@@ -1,0 +1,39 @@
+seed: 2026
+mechanics:
+  length_mm: 10.0
+  b: 4.0
+  bf: 6.0
+  parameter_bounds_kpa: [[1.0, 8.0], [2.0, 24.0]]
+  loads_kpa: [[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]]
+  grid_size: 41
+data:
+  train_cases: 1024
+  validation_cases: 64
+  test_cases: 100
+  noise_levels: [0.0, 0.01, 0.05]
+  observed_fractions: [1.0, 0.5, 0.25]
+environment:
+  horizon: 63
+  action_scale: 0.2
+  step_cost: 0.02
+  reward_discount: 0.99
+  success_tolerance: 0.000001
+training:
+  timesteps: 300000
+  learning_starts: 2000
+  batch_size: 256
+  buffer_size: 200000
+  learning_rate: 0.0003
+  hidden_sizes: [128, 128]
+  eval_frequency: 10000
+  eval_cases: 18
+  checkpoint_frequency: 25000
+  threads: 6
+  n_envs: 4
+  train_freq: 4
+  gradient_steps: 4
+evaluation:
+  budgets: [16, 32, 64]
+  parameter_success_threshold: 0.1
+  direct_train_samples: 12000
+  direct_epochs: 150

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+data/
+runs/
+logs/
+dist/
+*.pyc
+scripts/hpc/site.env
+scripts/hpc/cluster.env
+
+# Keep Markdown documentation in the root README only.
+*.[mM][dD]
+!/README.md
