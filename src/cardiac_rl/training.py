@@ -19,6 +19,36 @@ from .data import fixed_tasks, load_cases, prepare
 from .environment import CalibrationEnv
 
 
+def save_checkpoint(model, directory, label):
+    """Write complete temporary files before replacing a checkpoint pair."""
+    model.save(directory / f"{label}.pending.zip")
+    model.save_replay_buffer(directory / f"{label}.pending.pkl")
+    (directory / f"{label}.pending.zip").replace(directory / f"{label}.zip")
+    (directory / f"{label}.pending.pkl").replace(directory / f"{label}_replay.pkl")
+    save_json(directory / f"{label}.state.json", {"timesteps": model.num_timesteps})
+
+
+def restore_checkpoint(directory, env, device):
+    errors = []
+    for label in ("last", "checkpoint"):
+        path = directory / f"{label}.zip"
+        if not path.exists():
+            continue
+        try:
+            model = SAC.load(path, env=env, device=device)
+            state = directory / f"{label}.state.json"
+            if state.exists() and json.loads(state.read_text())["timesteps"] != model.num_timesteps:
+                raise ValueError("Checkpoint pair was not fully committed")
+            replay = directory / f"{label}_replay.pkl"
+            if replay.exists():
+                model.load_replay_buffer(replay)
+            print(f"Restored {path} at {model.num_timesteps} transitions", flush=True)
+            return model
+        except Exception as error:
+            errors.append(f"{label}: {error}")
+    raise ValueError("No recoverable checkpoint: " + "; ".join(errors))
+
+
 def evaluate_policy(model, config, mechanics, cases, tasks):
     env = CalibrationEnv(config, mechanics, cases)
     errors, losses, calls = [], [], []
@@ -39,7 +69,7 @@ def evaluate_policy(model, config, mechanics, cases, tasks):
 
 
 class ValidationCallback(BaseCallback):
-    def __init__(self, config, mechanics, cases, tasks, directory, stop):
+    def __init__(self, config, mechanics, cases, tasks, directory, stop, deadline=None):
         super().__init__()
         self.config, self.mechanics, self.cases = config, mechanics, cases
         self.tasks, self.directory, self.stop = tasks, directory, stop
@@ -49,6 +79,7 @@ class ValidationCallback(BaseCallback):
         self.last_eval, self.last_checkpoint = 0, 0
         self.validation_seconds = 0.
         self.validation_calls = 0
+        self.deadline = deadline
 
     def validate(self):
         start = time.perf_counter()
@@ -69,20 +100,31 @@ class ValidationCallback(BaseCallback):
         self.validate()
 
     def _on_step(self):
+        if self.stop["requested"]:
+            return False
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.stop["reason"] = "time_budget"
+            return False
         if self.num_timesteps-self.last_eval >= self.config["training"]["eval_frequency"]:
             self.validate()
             self.last_eval = self.num_timesteps
         if self.num_timesteps-self.last_checkpoint >= self.config["training"]["checkpoint_frequency"]:
-            self.model.save(self.directory / "checkpoint.zip")
-            self.model.save_replay_buffer(self.directory / "checkpoint_replay.pkl")
+            save_checkpoint(self.model, self.directory, "checkpoint")
             self.last_checkpoint = self.num_timesteps
         return not self.stop["requested"]
 
 
-def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=False):
+def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=False,
+          max_seconds=None, threads=None):
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("--max-seconds must be positive")
+    if steps is not None and steps <= 0:
+        raise ValueError("--steps must be positive")
+    if threads is not None and threads < 1:
+        raise ValueError("--threads must be positive")
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    torch.set_num_threads(config["training"]["threads"])
+    torch.set_num_threads(threads or config["training"]["threads"])
     directory = Path(output)
     directory.mkdir(parents=True, exist_ok=True)
     signature = fingerprint(config)
@@ -120,13 +162,7 @@ def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=Fa
             old_handlers[sig] = signal.signal(sig, request_stop)
     settings = config["training"]
     if resume:
-        checkpoint = directory / "last.zip"
-        if not checkpoint.exists():
-            checkpoint = directory / "checkpoint.zip"
-        model = SAC.load(checkpoint, env=vec_env, device=device)
-        replay = directory / ("last_replay.pkl" if checkpoint.name == "last.zip" else "checkpoint_replay.pkl")
-        if replay.exists():
-            model.load_replay_buffer(replay)
+        model = restore_checkpoint(directory, vec_env, device)
     else:
         model = SAC("MlpPolicy", vec_env, seed=seed, device=device, verbose=0,
                     learning_rate=settings["learning_rate"], buffer_size=settings["buffer_size"],
@@ -138,13 +174,20 @@ def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=Fa
     metadata = {"config_fingerprint": signature, "seed": seed, "device": str(model.device),
                 "requested_device": device, "python": platform.python_version(),
                 "platform": platform.platform(), "status": "running", "resumed": resume,
+                "cpu_threads": torch.get_num_threads(), "wall_clock_budget_seconds": max_seconds,
+                "recovered_start_timesteps": model.num_timesteps,
+                "prior_costs_may_be_incomplete": (previous or {}).get("status") == "running",
+                "transition_target": steps if steps is not None else (None if max_seconds is not None else settings["timesteps"]),
                 "packages": {name: importlib.metadata.version(name)
                              for name in ("numpy", "scipy", "torch", "gymnasium", "stable-baselines3")}}
     if torch.cuda.is_available():
-        metadata["gpu"] = torch.cuda.get_device_name(0)
+        metadata["gpu"] = torch.cuda.get_device_name(model.device.index or 0) if model.device.type == "cuda" else None
     save_json(metadata_path, metadata)
-    callback = ValidationCallback(config, mechanics, validation_cases, tasks, directory, stop)
-    target = int(steps or settings["timesteps"])
+    deadline = time.monotonic()+max_seconds if max_seconds is not None else None
+    callback = ValidationCallback(config, mechanics, validation_cases, tasks, directory, stop, deadline)
+    # In timed mode a sentinel horizon lets the callback end training by elapsed
+    # time. Constant SAC learning rates do not depend on this horizon.
+    target = int(steps if steps is not None else (2**53 if max_seconds is not None else settings["timesteps"]))
     remaining = target-model.num_timesteps
     start = time.perf_counter()
     initial_steps = model.num_timesteps
@@ -157,15 +200,15 @@ def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=Fa
         failed = True
         raise
     finally:
-        model.save(directory / "last.zip")
-        model.save_replay_buffer(directory / "last_replay.pkl")
+        save_checkpoint(model, directory, "last")
         env_calls = sum(env.unwrapped.forward_calls for env in vec_env.envs)
         metadata.update({"timesteps": model.num_timesteps,
                          "new_timesteps": model.num_timesteps-initial_steps,
                          "training_forward_calls": env_calls+(previous or {}).get("training_forward_calls", 0),
                          "validation_forward_calls": callback.validation_calls+(previous or {}).get("validation_forward_calls", 0),
                          "total_training_seconds": time.perf_counter()-start+(previous or {}).get("total_training_seconds", 0),
-                         "status": "failed" if failed else ("interrupted" if stop["requested"] else "completed")})
+                         "status": "failed" if failed else ("interrupted" if stop["requested"] else
+                                   ("time_budget_completed" if stop.get("reason") == "time_budget" else "completed"))})
         save_json(metadata_path, metadata)
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#PBS -N cardiac_rl_max
+#PBS -l select=1:ncpus=28:mem=240gb:ngpus=4
+#PBS -l place=excl
+#PBS -l walltime=168:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit from the project root}"
+if [[ -f scripts/hpc/cluster.env ]]; then source scripts/hpc/cluster.env; fi
+if [[ -n "${HPC_MODULE_INIT:-}" ]]; then source "$HPC_MODULE_INIT"; fi
+mkdir -p logs
+# The existing tested environment is reused; no dependency installation occurs.
+exec .venv/bin/python -m cardiac_rl.allocation \
+  --config "${CONFIG:-configs/default.yaml}" \
+  --data-dir "${DATA_DIR:-data/p100_full}" \
+  --output "${RUN_ROOT:-runs/p100_full}" \
+  --seeds "${SEEDS:-4}" --seed-start "${SEED_START:-0}" \
+  --expected-walltime-hours 168 \
+  --evaluation-reserve-hours "${EVALUATION_RESERVE_HOURS:-6}"

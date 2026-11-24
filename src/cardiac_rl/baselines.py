@@ -153,6 +153,7 @@ def train_direct(config, data_dir, directory, seed, device="cpu"):
     torch.save({"state_dict": best_state, "inputs": x.shape[1], "seed": seed,
                 "config_fingerprint": fingerprint(config)}, path)
     save_json(directory / "direct.json", {"training_seconds": time.perf_counter()-start,
+              "device": device,
               "training_examples": len(x), "validation_examples": len(vx),
               "unique_training_parameter_cases": len(z), "additional_forward_calls": 0,
               "validation_mse": history, "selected_validation_mse": best})

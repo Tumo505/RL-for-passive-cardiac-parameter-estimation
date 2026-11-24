@@ -250,3 +250,25 @@ The smoke run establishes software operation and budget accounting, not scientif
 ## Repository contents
 
 Only the root `README.md` is tracked as Markdown. Supplementary local Markdown files are ignored; the HPC instructions and scientific protocol are maintained in this README. Generated data, model checkpoints, logs, local environments and cluster configuration files are also ignored.
+
+## Maximum walltime allocation
+
+`scripts/hpc/max-allocation.pbs` requests the known maximum of 168 hours, one exclusive node, 28 CPUs, 240 GB RAM and four GPUs. Supply the queue and any software resource with `qsub` (or the site's supported submission mechanism). A new allocation is required when an existing job has only a short walltime; a shell variable cannot extend PBS's enforced limit.
+
+```bash
+qsub -q YOUR_GPU_QUEUE -l software=YOUR_SITE_RESOURCE scripts/hpc/max-allocation.pbs
+```
+
+The launcher reads the **granted** walltime and elapsed time using `qstat -f`, checks CPU affinity and CPU allocation limits, and uses the GPUs visible under the scheduler's device mask. It refuses a granted limit below the requested 168 hours. Four seeds run concurrently: each has its own GPU if four are visible; when only one or two are visible, processes share those GPUs. All allocated CPU threads are divided across the seed processes. If more than four GPUs are visible, increase `SEEDS` to use all GPUs; this creates additional independent seeds.
+
+Training uses `--max-seconds` rather than a fixed transition count. It continues until the training deadline, preserving the best validation checkpoint. Six hours of the allocation are reserved for the full reference-solver comparisons and two minutes for checkpoint grace. `EVALUATION_RESERVE_HOURS` can adjust this estimate. Final evaluation runtime is not guaranteed to fit the reserve; inspect outputs before treating the experiment as complete. Memory remains demand-driven: filling unused RAM does not improve this small model, and algorithm/replay settings remain unchanged for compatibility with existing runs.
+
+Existing material cases and partially trained seeds are reused automatically. Checkpoint loading falls back to the periodic pair if the final pair is unreadable. Complete temporary checkpoint files replace the persistent files, followed by a step-count manifest. A hard kill during replacement can still invalidate a pair; retain both final and periodic pairs. Timed completion is recorded as `time_budget_completed`, which means the assigned training time ended, not that convergence was established. When recovering a run killed before metadata was saved, previous cost totals may be incomplete and are flagged in `run.json`.
+
+For a short **software test** inside an appropriately allocated GPU job, explicitly lower the expected walltime and reserve:
+
+```bash
+.venv/bin/python -m cardiac_rl.allocation --expected-walltime-hours 0 --evaluation-reserve-hours 0.01
+```
+
+The maximum-allocation workflow does not reinstall dependencies. Keep a previously tested environment, especially on older GPUs/drivers. GPU selection uses the scheduler-visible logical device indices and never expands `CUDA_VISIBLE_DEVICES` to access unallocated devices. Validation, checkpointing and final evaluation consume part of the allocated time; absolute GPU utilisation depends on the small model and CPU-bound mechanics work.

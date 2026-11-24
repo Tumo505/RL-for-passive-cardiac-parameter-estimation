@@ -46,14 +46,16 @@ def identifiability(mechanics, task):
             "jacobian_condition": float(singular[0]/max(singular[-1], 1e-15))}
 
 
-def evaluate(config, data_dir, directory, methods=None, backend="grid", limit=None, seed=0, direct_device="cpu"):
+def evaluate(config, data_dir, directory, methods=None, backend="grid", limit=None, seed=0, direct_device="cpu", threads=None):
     directory = Path(directory)
     metadata = json.loads((directory / "run.json").read_text())
     if metadata["config_fingerprint"] != fingerprint(config):
         raise ValueError("Evaluation configuration differs from training run")
     if metadata["seed"] != seed:
         raise ValueError("Evaluation seed must match the training run seed")
-    torch.set_num_threads(config["training"]["threads"])
+    if threads is not None and threads < 1:
+        raise ValueError("--threads must be positive")
+    torch.set_num_threads(threads or config["training"]["threads"])
     mechanics = prepare(config, data_dir)
     cases = load_cases(config, data_dir, "test")
     methods = list(methods or METHODS)

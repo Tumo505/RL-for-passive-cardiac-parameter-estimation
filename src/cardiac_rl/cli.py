@@ -20,11 +20,14 @@ def main():
             sub.add_argument("--device", default="auto")
             sub.add_argument("--steps", type=int, help="Target TOTAL transitions, including any resumed training")
             sub.add_argument("--resume", action="store_true")
+            sub.add_argument("--max-seconds", type=float, help="Wall-clock training budget; no default transition cap in this mode")
+            sub.add_argument("--threads", type=int, help="Runtime CPU thread override; preserves configuration compatibility")
         if name == "evaluate":
             sub.add_argument("--backend", choices=("grid", "reference"), default="grid")
             sub.add_argument("--methods", nargs="+", default=None)
             sub.add_argument("--limit", type=int, help="Maximum held-out parameter cases, before noise/mask expansion")
             sub.add_argument("--direct-device", default="cpu")
+            sub.add_argument("--threads", type=int)
     sub = commands.add_parser("aggregate")
     sub.add_argument("--root", default="runs/default")
     sub.add_argument("--output", default="runs/default/aggregate.json")
@@ -61,7 +64,8 @@ def main():
         print(f"Prepared {args.data_dir}")
     elif args.command == "train":
         from .training import train
-        result = train(config, args.data_dir, args.output, args.seed, args.device, args.steps, args.resume)
+        result = train(config, args.data_dir, args.output, args.seed, args.device, args.steps, args.resume,
+                       args.max_seconds, args.threads)
         print(json.dumps(result, indent=2))
         if result["status"] == "interrupted":
             raise SystemExit(75)
@@ -70,7 +74,7 @@ def main():
         if args.limit is not None and args.limit < 1:
             parser.error("--limit must be positive")
         output = evaluate(config, args.data_dir, args.output, args.methods, args.backend,
-                          args.limit, args.seed, args.direct_device)
+                          args.limit, args.seed, args.direct_device, args.threads)
         print(f"Evaluation saved to {output}")
 
 
