@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--expected-walltime-hours", type=float, default=168)
     parser.add_argument("--evaluation-reserve-hours", type=float, default=6)
     parser.add_argument("--checkpoint-grace-seconds", type=float, default=120)
+    parser.add_argument("--evaluate-only", action="store_true", help="Evaluate existing best policies without starting or resuming training")
     args = parser.parse_args()
     job_id = os.environ.get("PBS_JOBID")
     if not job_id:
@@ -98,12 +99,19 @@ def main():
     deadline = time.monotonic()+remaining
     reserve = args.evaluation_reserve_hours*3600
     grace = args.checkpoint_grace_seconds
-    if remaining <= reserve+grace:
+    if remaining <= (grace if args.evaluate_only else reserve+grace):
         parser.error("Insufficient remaining allocation time for training plus final evaluation")
     root = Path(args.output)
     logs = Path("logs")
     logs.mkdir(exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
+    if args.evaluate_only:
+        missing = [str(root / f"seed_{seed}" / name)
+                   for seed in range(args.seed_start, args.seed_start+args.seeds)
+                   for name in ("run.json", "best.zip", "best.json")
+                   if not (root / f"seed_{seed}" / name).exists()]
+        if missing:
+            parser.error("Evaluation-only mode requires saved policies: " + ", ".join(missing))
     config = load_config(args.config)
     prepare(config, args.data_dir)
     manifest = {**allocation, "job_id": job_id, "visible_gpus": gpu_count,
@@ -111,9 +119,10 @@ def main():
                 "usable_cpus": cpu_count, "workers": plan, "seed_start": args.seed_start,
                 "evaluation_reserve_hours": args.evaluation_reserve_hours,
                 "checkpoint_grace_seconds": grace, "training_transition_cap": None,
+                "evaluate_only": args.evaluate_only,
                 "policy": "Concurrent independent seeds, distributed across scheduler-visible GPUs",
                 "memory_policy": "Demand-driven, algorithm/replay settings unchanged"}
-    save_json(root / "allocation.json", manifest)
+    save_json(root / ("evaluation_allocation.json" if args.evaluate_only else "allocation.json"), manifest)
     print(json.dumps(manifest, indent=2), flush=True)
     stopped = {"requested": False}
     children = []
@@ -178,7 +187,8 @@ def main():
             for handle in handles:
                 handle.close()
 
-    run_phase("train")
+    if not args.evaluate_only:
+        run_phase("train")
     run_phase("evaluate")
     aggregate(root, root / "aggregate.json")
     print(f"Completed full reference comparison: {root / 'aggregate.json'}", flush=True)

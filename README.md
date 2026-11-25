@@ -272,3 +272,17 @@ For a short **software test** inside an appropriately allocated GPU job, explici
 ```
 
 The maximum-allocation workflow does not reinstall dependencies. Keep a previously tested environment, especially on older GPUs/drivers. GPU selection uses the scheduler-visible logical device indices and never expands `CUDA_VISIBLE_DEVICES` to access unallocated devices. Validation, checkpointing and final evaluation consume part of the allocated time; absolute GPU utilisation depends on the small model and CPU-bound mechanics work.
+
+## Finish training early and evaluate
+
+For an already-running maximum-allocation job, editing the launcher source cannot change the code already loaded in that process. The controlled handoff uses a separate evaluation-only job with a PBS `afterany` dependency on the training job. It validates and backs up the currently selected policies, submits evaluation, records the returned job ID, and then sends `USR1` to request a graceful training stop. The old launcher deliberately reports interruption/nonzero exit after saving; `afterany` allows evaluation to start after that exit, when policy files are no longer being written. No `qdel` or forced kill is used. If submission fails, no stop signal is sent. If signalling fails, the evaluation job remains dependent and the training job continues.
+
+Run on the submission host, from the project root, after updating the source:
+
+```bash
+bash scripts/hpc/finish-training.sh TRAINING_JOB_ID
+```
+
+The queue/resource settings come from the ignored `scripts/hpc/cluster.env` or the environment. This workflow applies to the Python maximum-allocation launcher, which handles `USR1`; it is not a general cancellation script for unrelated jobs. The evaluation-only job requests the same resources and maximum walltime, reuses existing models/data and runs all six methods against reference mechanics. It never starts or resumes SAC training. `evaluation_allocation.json` preserves the new resource record separately from the original training `allocation.json`.
+
+The script records the successor job in `runs/p100_full/evaluation_request_TRAINING_JOB_ID.json`. A repeated request exits without submitting duplicates. Verify successor status with `qstat` and inspect `logs/evaluate_SUCCESSOR_JOB_ID_seed_*.log`. The experiment remains incomplete until all four reference evaluation jobs finish and `aggregate.json` is produced. Successful execution is not evidence of clinical validity or superiority over the baselines; those claims require analysis of the resulting estimates, uncertainty and computational costs.

@@ -51,14 +51,23 @@ def test_pbs_duration_validates_minutes():
         duration_seconds("01:70:00")
 
 
-def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("evaluate_only", [False, True])
+def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkeypatch, evaluate_only):
     monkeypatch.chdir(tmp_path)
     root = tmp_path / "run"
     (root / "seed_0").mkdir(parents=True)
     (root / "seed_0/run.json").write_text("{}")
     monkeypatch.setenv("PBS_JOBID", "123.example")
     monkeypatch.delenv("PBS_NP", raising=False)
-    monkeypatch.setattr(sys, "argv", ["allocation", "--output", str(root)])
+    argv = ["allocation", "--output", str(root)]
+    if evaluate_only:
+        argv.append("--evaluate-only")
+        (root / "allocation.json").write_text("original training allocation")
+        for seed in range(4):
+            (root / f"seed_{seed}").mkdir(exist_ok=True)
+            for name in ("run.json", "best.json", "best.zip"):
+                (root / f"seed_{seed}" / name).write_text("test artifact")
+    monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(allocation_module, "load_config", lambda path: {})
     monkeypatch.setattr(allocation_module, "prepare", lambda *args: None)
     monkeypatch.setattr(allocation_module.os, "sched_getaffinity", lambda pid: set(range(28)), raising=False)
@@ -85,17 +94,20 @@ def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkey
     monkeypatch.setattr(allocation_module.subprocess, "Popen", FinishedProcess)
     monkeypatch.setattr(allocation_module, "aggregate", lambda *args: aggregates.append(args))
     allocation_module.main()
-    assert len(launches) == 8
-    for index, (command, environment) in enumerate(launches[:4]):
+    assert len(launches) == (4 if evaluate_only else 8)
+    for index, (command, environment) in enumerate([] if evaluate_only else launches[:4]):
         assert command[3] == "train"
         assert "--max-seconds" in command and "--steps" not in command
         assert command[command.index("--device")+1] == "cuda:0"
         assert environment["OMP_NUM_THREADS"] == "7"
         assert ("--resume" in command) == (index == 0)
-    for command, _ in launches[4:]:
+    for command, _ in (launches if evaluate_only else launches[4:]):
         assert command[3] == "evaluate"
         assert command[command.index("--backend")+1] == "reference"
     assert len(aggregates) == 1
+    if evaluate_only:
+        assert (root / "allocation.json").read_text() == "original training allocation"
+        assert (root / "evaluation_allocation.json").exists()
 
 
 def test_short_pbs_allocation_is_rejected_before_launch(tmp_path, monkeypatch):
