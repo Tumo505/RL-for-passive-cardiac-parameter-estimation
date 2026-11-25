@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#PBS -N cardiac_hybrid_test
+#PBS -l select=1:ncpus=28:mem=240gb:ngpus=4
+#PBS -l place=excl
+#PBS -l walltime=168:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit from project root}"
+if [[ -f scripts/hpc/cluster.env ]]; then source scripts/hpc/cluster.env; fi
+if [[ -n "${HPC_MODULE_INIT:-}" ]]; then source "$HPC_MODULE_INIT"; fi
+mkdir -p logs
+# Run after selecting/fixing the revised design on validation results.
+exec .venv/bin/python -m cardiac_rl.allocation --workflow hybrid --evaluate-only \
+  --config "${CONFIG:-configs/hybrid.yaml}" \
+  --data-dir "${DATA_DIR:-data/hybrid_v2}" --output "${RUN_ROOT:-runs/hybrid_v2}" \
+  --seeds "${SEEDS:-4}" --seed-start "${SEED_START:-0}" \
+  --evaluation-split test --confirm-test --expected-walltime-hours 0

@@ -26,6 +26,8 @@ def test_train_checkpoint_resume_evaluate_and_infer(tmp_path):
     resumed = train(config, data, run, seed=0, device="cpu", steps=48, resume=True)
     assert resumed["timesteps"] == 48 and resumed["resumed"]
     assert resumed["training_forward_calls"] > first["training_forward_calls"]
+    unchanged = train(config, data, run, seed=0, device="cpu", steps=48, resume=True)
+    assert unchanged["new_timesteps"] == 0 and unchanged["timesteps"] == 48
     results = evaluate(config, data, run, backend="reference", seed=0)
     assert (results / "benchmark.png").exists()
     summary = json.loads((results / "summary.json").read_text())

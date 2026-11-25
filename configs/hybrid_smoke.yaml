@@ -1,0 +1,92 @@
+seed: 20271125
+mechanics:
+  length_mm: 10.0
+  b: 4.0
+  bf: 6.0
+  parameter_bounds_kpa:
+  - - 1.0
+    - 8.0
+  - - 2.0
+    - 24.0
+  loads_kpa:
+  - - 0.5
+    - 0.5
+  - - 1.5
+    - 0.5
+  - - 0.5
+    - 1.5
+  - - 1.5
+    - 1.5
+  grid_size: 17
+data:
+  train_cases: 128
+  validation_cases: 24
+  test_cases: 12
+  noise_levels:
+  - 0.0
+  - 0.01
+  - 0.05
+  observed_fractions:
+  - 1.0
+  - 0.5
+  - 0.25
+environment:
+  horizon: 15
+  action_scale: 0.25
+  step_cost: 0.02
+  reward_discount: 1.0
+  success_tolerance: 1.0e-06
+training:
+  timesteps: 2000
+  learning_starts: 128
+  batch_size: 64
+  buffer_size: 10000
+  learning_rate: 0.0003
+  hidden_sizes:
+  - 64
+  - 64
+  eval_frequency: 500
+  eval_cases: 18
+  checkpoint_frequency: 1000
+  threads: 1
+  n_envs: 1
+  train_freq: 4
+  gradient_steps: 1
+evaluation:
+  budgets:
+  - 4
+  - 8
+  parameter_success_threshold: 0.1
+  direct_train_samples: 512
+  direct_epochs: 20
+hybrid:
+  version: 2
+  reward_mode: parameter
+  noise_floor: 0.0001
+  regularization_weight: 1.0
+  prior_std_floor: 0.03
+  finite_difference_step: 0.001
+  stop_threshold: 0.5
+  call_penalty: 0.002
+  gradient_tolerance: 1.0e-07
+  step_tolerance: 1.0e-05
+  cost_tolerance: 1.0e-07
+  validation_cases_per_condition: 2
+  early_stopping_patience: 3
+  minimum_timesteps: 1000
+  minimum_validation_improvement: 0.001
+  initializer_samples: 1024
+  initializer_epochs: 20
+  initializer_patience: 5
+  initializer_batch_size: 256
+  initializer_hidden_sizes:
+  - 64
+  - 64
+  entropy_coefficient: auto_0.01
+  target_entropy: -4.0
+  training_budgets:
+  - 4
+  - 8
+  exclude_datasets:
+  - data/p100_full
+  - data/default

@@ -52,24 +52,28 @@ def test_pbs_duration_validates_minutes():
 
 
 @pytest.mark.parametrize("evaluate_only", [False, True])
-def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkeypatch, evaluate_only):
+@pytest.mark.parametrize("workflow", ["legacy", "hybrid"])
+def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkeypatch, evaluate_only, workflow):
     monkeypatch.chdir(tmp_path)
     root = tmp_path / "run"
     (root / "seed_0").mkdir(parents=True)
     (root / "seed_0/run.json").write_text("{}")
     monkeypatch.setenv("PBS_JOBID", "123.example")
     monkeypatch.delenv("PBS_NP", raising=False)
-    argv = ["allocation", "--output", str(root)]
+    argv = ["allocation", "--output", str(root), "--workflow", workflow]
     if evaluate_only:
         argv.append("--evaluate-only")
         (root / "allocation.json").write_text("original training allocation")
         for seed in range(4):
             (root / f"seed_{seed}").mkdir(exist_ok=True)
-            for name in ("run.json", "best.json", "best.zip"):
+            for name in ("run.json", "best.json", "best.zip", "initializer.pt", "frozen.json"):
                 (root / f"seed_{seed}" / name).write_text("test artifact")
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(allocation_module, "load_config", lambda path: {})
     monkeypatch.setattr(allocation_module, "prepare", lambda *args: None)
+    import cardiac_rl.hybrid.setup as hybrid_setup
+    monkeypatch.setattr(hybrid_setup, "configuration", lambda path: {"training": {"timesteps": 1000000}})
+    monkeypatch.setattr(hybrid_setup, "prepare_hybrid", lambda *args: None)
     monkeypatch.setattr(allocation_module.os, "sched_getaffinity", lambda pid: set(range(28)), raising=False)
     monkeypatch.setattr(allocation_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(allocation_module.torch.cuda, "device_count", lambda: 1)
@@ -97,6 +101,7 @@ def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkey
     assert len(launches) == (4 if evaluate_only else 8)
     for index, (command, environment) in enumerate([] if evaluate_only else launches[:4]):
         assert command[3] == "train"
+        assert command[2] == ("cardiac_rl.hybrid_cli" if workflow == "hybrid" else "cardiac_rl.cli")
         assert "--max-seconds" in command and "--steps" not in command
         assert command[command.index("--device")+1] == "cuda:0"
         assert environment["OMP_NUM_THREADS"] == "7"
@@ -104,6 +109,9 @@ def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkey
     for command, _ in (launches if evaluate_only else launches[4:]):
         assert command[3] == "evaluate"
         assert command[command.index("--backend")+1] == "reference"
+        if workflow == "hybrid":
+            assert command[command.index("--split")+1] == "validation"
+            assert "--confirm-test" not in command
     assert len(aggregates) == 1
     if evaluate_only:
         assert (root / "allocation.json").read_text() == "original training allocation"

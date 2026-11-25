@@ -191,7 +191,7 @@ def aggregate(root, output):
     for path in paths:
         with path.open() as handle:
             for row in csv.DictReader(handle):
-                key = (row["backend"], row["method"], int(row["budget"]), float(row["noise"]), float(row["observed_fraction"]))
+                key = (row["backend"], row["method"], int(row["budget"]), float(row["noise"]), float(row["observed_fraction"]), row.get("split", "test"))
                 groups[key].append(row)
     rng, report = np.random.default_rng(739), []
     for key, group in groups.items():
@@ -210,7 +210,7 @@ def aggregate(root, output):
             sample = matrix[rng.integers(len(seeds), size=len(seeds))][:, rng.integers(len(cases), size=len(cases))]
             draws.append(float(np.median(sample)))
         report.append({"backend": key[0], "method": key[1], "budget": key[2], "noise": key[3],
-                       "observed_fraction": key[4], "seeds": len(seeds), "parameter_cases": len(cases),
+                       "observed_fraction": key[4], "split": key[5], "seeds": len(seeds), "parameter_cases": len(cases),
                        "median_relative_parameter_error": float(np.median(matrix)),
                        "crossed_seed_case_bootstrap_ci95": np.quantile(draws, [.025, .975]).tolist()})
     save_json(output, {"source_files": [str(p) for p in paths], "groups": report})

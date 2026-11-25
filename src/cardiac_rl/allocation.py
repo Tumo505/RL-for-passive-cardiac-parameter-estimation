@@ -73,7 +73,12 @@ def main():
     parser.add_argument("--evaluation-reserve-hours", type=float, default=6)
     parser.add_argument("--checkpoint-grace-seconds", type=float, default=120)
     parser.add_argument("--evaluate-only", action="store_true", help="Evaluate existing best policies without starting or resuming training")
+    parser.add_argument("--workflow", choices=("legacy", "hybrid"), default="legacy")
+    parser.add_argument("--evaluation-split", choices=("validation", "test"), default="validation")
+    parser.add_argument("--confirm-test", action="store_true")
     args = parser.parse_args()
+    if args.workflow == "hybrid" and args.evaluation_split == "test" and not args.confirm_test:
+        parser.error("Freeze hybrid configuration and pass --confirm-test for the fresh final test")
     job_id = os.environ.get("PBS_JOBID")
     if not job_id:
         parser.error("Run inside a PBS allocation; PBS_JOBID is absent")
@@ -108,18 +113,26 @@ def main():
     if args.evaluate_only:
         missing = [str(root / f"seed_{seed}" / name)
                    for seed in range(args.seed_start, args.seed_start+args.seeds)
-                   for name in ("run.json", "best.zip", "best.json")
+                   for name in (("run.json", "best.zip", "best.json", "initializer.pt", "frozen.json")
+                                if args.workflow == "hybrid" else ("run.json", "best.zip", "best.json"))
                    if not (root / f"seed_{seed}" / name).exists()]
         if missing:
             parser.error("Evaluation-only mode requires saved policies: " + ", ".join(missing))
-    config = load_config(args.config)
-    prepare(config, args.data_dir)
+    if args.workflow == "hybrid":
+        from .hybrid.setup import configuration, prepare_hybrid
+        config = configuration(args.config)
+        prepare_hybrid(config, args.data_dir)
+    else:
+        config = load_config(args.config)
+        prepare(config, args.data_dir)
     manifest = {**allocation, "job_id": job_id, "visible_gpus": gpu_count,
                 "gpu_names": [torch.cuda.get_device_name(i) for i in range(gpu_count)],
                 "usable_cpus": cpu_count, "workers": plan, "seed_start": args.seed_start,
                 "evaluation_reserve_hours": args.evaluation_reserve_hours,
-                "checkpoint_grace_seconds": grace, "training_transition_cap": None,
+                "checkpoint_grace_seconds": grace,
+                "training_transition_cap": config["training"]["timesteps"] if args.workflow == "hybrid" else None,
                 "evaluate_only": args.evaluate_only,
+                "workflow": args.workflow, "evaluation_split": args.evaluation_split if args.workflow == "hybrid" else "test",
                 "policy": "Concurrent independent seeds, distributed across scheduler-visible GPUs",
                 "memory_policy": "Demand-driven, algorithm/replay settings unchanged"}
     save_json(root / ("evaluation_allocation.json" if args.evaluate_only else "allocation.json"), manifest)
@@ -143,7 +156,8 @@ def main():
             for worker in plan:
                 seed = args.seed_start+worker["slot"]
                 directory = root / f"seed_{seed}"
-                command = [sys.executable, "-m", "cardiac_rl.cli", phase, "--config", args.config,
+                module = "cardiac_rl.hybrid_cli" if args.workflow == "hybrid" else "cardiac_rl.cli"
+                command = [sys.executable, "-m", module, phase, "--config", args.config,
                            "--data-dir", args.data_dir, "--output", str(directory), "--seed", str(seed),
                            "--threads", str(worker["threads"])]
                 if phase == "train":
@@ -155,6 +169,10 @@ def main():
                         command.append("--resume")
                 else:
                     command += ["--backend", "reference", "--direct-device", worker["device"]]
+                    if args.workflow == "hybrid":
+                        command += ["--split", args.evaluation_split]
+                        if args.confirm_test:
+                            command.append("--confirm-test")
                 environment = os.environ.copy()
                 for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
                     environment[name] = str(worker["threads"])

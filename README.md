@@ -2,6 +2,8 @@
 
 This project trains a reusable Soft Actor-Critic (SAC) policy to estimate two passive material parameters from sparse, noisy displacement observations. It includes a mechanics solver, a Gymnasium environment, reproducible case splits, five comparison methods, evaluation plots, checkpoints, and a four-GPU PBS workflow for a PBS cluster.
 
+The revised [hybrid version-two workflow](#hybrid-calibration-version-two) adds learned initialisation, RL-controlled mechanics corrections, convergence-aware comparators and fresh data. The original CLI and configurations remain available to reproduce the first experiment.
+
 The implemented mechanics problem is a **homogeneous myocardial slab under known biaxial traction**. It is a reduced tissue benchmark, not a ventricular finite-element model, patient digital twin, or simulation of biological regeneration. Parameter ranges are illustrative benchmark ranges, not fitted human measurements. No claim of improved calibration performance is built into the implementation.
 
 ## Run locally
@@ -286,3 +288,86 @@ bash scripts/hpc/finish-training.sh TRAINING_JOB_ID
 The queue/resource settings come from the ignored `scripts/hpc/cluster.env` or the environment. This workflow applies to the Python maximum-allocation launcher, which handles `USR1`; it is not a general cancellation script for unrelated jobs. The evaluation-only job requests the same resources and maximum walltime, reuses existing models/data and runs all six methods against reference mechanics. It never starts or resumes SAC training. `evaluation_allocation.json` preserves the new resource record separately from the original training `allocation.json`.
 
 The script records the successor job in `runs/p100_full/evaluation_request_TRAINING_JOB_ID.json`. A repeated request exits without submitting duplicates. Verify successor status with `qstat` and inspect `logs/evaluate_SUCCESSOR_JOB_ID_seed_*.log`. The experiment remains incomplete until all four reference evaluation jobs finish and `aggregate.json` is produced. Successful execution is not evidence of clinical validity or superiority over the baselines; those claims require analysis of the resulting estimates, uncertainty and computational costs.
+
+## Hybrid calibration version two
+
+The revised experiment asks whether a learned initial estimate and an RL refinement controller can achieve accurate calibration with fewer forward predictions. It retains the same passive slab physics, so improvements can be investigated without adding anatomical complexity. It does not assume that an RL controller will outperform a conventional solver supplied with the same learned initial estimate.
+
+### Changes to the estimator
+
+The measurement encoder uses **25 features**: for each of the four loads and two axes, it calculates the affine displacement slope, normalised measurement information and observed count, then adds a spatial-residual noise estimate. It does not use unobserved displacement values, true material parameters, clean synthetic fields or the simulator's known noise label. A floor of `0.0001` in normalised displacement units prevents division by zero for clean data.
+
+A supervised network predicts two normalised log material parameters from those features. Feature normalisation is fit on training observations only. Its prior scale is the diagonal validation RMSE, bounded below by `prior_std_floor`. This is an empirical, Gaussian conditional-prior approximation, not a calibrated posterior credible interval.
+
+SAC receives a 49-feature observation containing the compact measurements, whitened innovations, current/selected/initial parameters, prior scales, remaining budget and correction history. Its three continuous actions control:
+
+1. Levenberg–Marquardt damping, from `1e-6` to `1e2`.
+2. A trust radius from `0.005` to `1` in normalised log-parameter coordinates.
+3. Whether to stop and return the selected candidate.
+
+Every physical correction uses two finite-difference probes and at most one trial prediction. Bounds are enforced, trial steps are accepted only when the deployable objective improves, and all actual predictions count against the budget. Previously evaluated exact parameter points may be reused by every method. Cached stagnation ends an episode rather than allowing an infinite sequence of free repeated queries.
+
+The refinement objective is a plug-in Gaussian likelihood using noise estimated from observations, optionally combined with the learned Gaussian prior. All MAP comparators receive **the identical initialiser and prior scale**. The default synthetic training reward is improvement in absolute log parameter error minus a per-call penalty; parameter truth is an offline training label, never a policy input or a deployment selection/stopping rule. Setting `hybrid.reward_mode: objective` provides a displacement/MAP-objective reward ablation. Setting `hybrid.regularization_weight: 0` removes the learned prior. Use separate run directories for these configuration changes.
+
+### Comparators and attribution
+
+| Method | Initial estimate | Objective and correction |
+|---|---|---|
+| `mechanics_direct` | Derived from measured stretches | Bounded linear stress-space fit; one output audit prediction |
+| `lsq_midpoint` | Bound midpoint | Unregularised, convergence-aware least squares |
+| `neural_only` | Learned | One prediction, no iterative correction |
+| `neural_lsq` | Learned | Unregularised, convergence-aware least squares |
+| `map_lsq_midpoint` | Bound midpoint | Same learned prior, MAP least squares |
+| `neural_map_lsq` | Learned | Same learned prior, MAP least squares |
+| `neural_lm` | Learned | Same MAP objective, conventional adaptive LM damping |
+| `hybrid_sac` | Learned | Same MAP objective, SAC-controlled LM and stopping |
+
+Least squares no longer fills unused budget with artificial restarts. The default maximum budgets are **4, 8, 16 and 32 actual forward calls**. An initial prediction and finite-difference probes are included. The direct predictor uses one prediction; methods may converge before their budget is exhausted. All online methods are timed on CPU, including feature extraction and learned initialisation, and reference audits are timed/count separately. Offline initialiser and RL training costs are recorded separately.
+
+Compare `hybrid_sac` with `neural_lm` and `neural_map_lsq` to assess the **incremental contribution of RL**. A win over midpoint initialisation alone does not establish an RL advantage. `mechanics_direct` is an additional strong model-specific comparator: at fixed stretches this law is linear in its two stiffness coefficients. With noise it solves a plug-in stress-space fit, which differs from displacement likelihood fitting. It omits loads with an unobserved stretch axis and falls back to the midpoint for rank-deficient observations. Per-call traces include post-hoc first-success diagnostics, based on test truth only after inference; those diagnostics are not deployable stopping rules. Report matched-accuracy efficiency, final success/error and offline training costs together.
+
+### Fresh data and validation stopping
+
+`configs/hybrid.yaml` uses sampling seed `20271125`, with **2,048 training, 128 validation and 300 fresh final-test material cases**. Existing legacy data directories are prohibited as output targets; if legacy datasets exist, exact overlapping parameter pairs are rejected. Source files and old result folders are preserved.
+
+Initialiser fitting, prior calibration, controller selection and stopping use training/validation data only. Controller validation is balanced over eight material cases and every noise/missingness combination (72 observation tasks), at an eight-call budget. The best checkpoint minimises mean absolute log parameter error. After at least 100,000 transitions, eight checks without an improvement of at least `0.001` stop training; a one-million-transition cap and optional wall-clock safety cap also apply. The initialiser has its own validation patience. These are research budgets, not instructions to train until a seven-day allocation expires.
+
+`frozen.json` records the selected policy, initialiser and source hashes. Final test evaluation requires `--split test --confirm-test` and rejects changed selected artifacts or implementation code. The normal pilot and HPC training job evaluate **validation only**. If implementation changes during development, resume/revalidate or start a separate run; a resume records a changed source hash. Validation and test results are aggregated separately using the `split` field.
+
+### Run a local validation pilot
+
+Use the existing environment; no new dependencies are required:
+
+```bash
+.venv/bin/python -m cardiac_rl.hybrid_cli prepare --config configs/hybrid_smoke.yaml --data-dir data/hybrid_smoke
+.venv/bin/python -m cardiac_rl.hybrid_cli train --config configs/hybrid_smoke.yaml --data-dir data/hybrid_smoke --output runs/hybrid_smoke/seed_0 --seed 0 --device cpu
+.venv/bin/python -m cardiac_rl.hybrid_cli evaluate --config configs/hybrid_smoke.yaml --data-dir data/hybrid_smoke --output runs/hybrid_smoke/seed_0 --seed 0 --split validation --backend reference
+```
+
+The smoke configuration has small sample/training budgets and 12 final-test cases that are not scored by these commands. The controller supports `--resume`, `--steps`, `--max-seconds` and `--threads`. A finite transition target and validation stopping remain active even when a wall-clock cap is supplied. `--steps` is the total target, not an increment.
+
+### Run the revised experiment on PBS
+
+On the submission host, update the source while preserving `.venv`, prior results and the ignored site configuration. Then submit with the actual site queue and optional software resource:
+
+```bash
+qsub -q YOUR_GPU_QUEUE -l software=YOUR_SITE_RESOURCE scripts/hpc/hybrid.pbs
+```
+
+The script requests the existing maximum resource envelope, discovers scheduler-visible GPUs/CPUs, trains four independent seeds, and automatically evaluates all eight methods on validation data against reference mechanics. It exits after completion, rather than holding the allocation until its walltime. It reuses the tested CUDA/PyTorch environment and writes to `data/hybrid_v2` and `runs/hybrid_v2`. Default validation output has 36,864 method/budget records per seed.
+
+After reviewing validation results and fixing the configuration, run the fresh test **once**:
+
+```bash
+qsub -q YOUR_GPU_QUEUE -l software=YOUR_SITE_RESOURCE scripts/hpc/hybrid-test.pbs
+```
+
+The second script is evaluation-only and explicitly enables the sealed test. It never resumes training. Default final-test output has 86,400 method/budget records per seed. Outputs are in `seed_*/evaluation_validation_reference/` and `seed_*/evaluation_test_reference/`, respectively. Completed identical evaluations can be reused; partial/different results require an explicit `--overwrite` recovery. `aggregate.json` includes separate validation/test groups.
+
+Do not use the legacy `finish-training.sh` handoff for hybrid runs. Hybrid training normally finishes through validation stopping; its dedicated evaluation-only script selects the correct controller, initialiser and measurement encoding. GPU usage is shared across seeds when the scheduler exposes fewer GPUs than seeds.
+
+### Completion and interpretation
+
+Useful artifacts include `initializer.pt`, `initializer.json`, `best.zip`, `best.json`, `early_stopping.json`, `frozen.json`, `run.json` and per-split results, traces, summaries, protocols and plots. Inference outcomes use the best deployable objective among evaluated candidates, never the smallest true parameter error seen during evaluation. Bootstrap uncertainty is over material cases and training seeds, keeping repeated observation conditions paired.
+
+The test set must remain unused while selecting reward weights, priors, network settings and stopping rules. If a learned initial estimate plus conventional LM matches RL, attribute the gain to learned initialisation/regularisation. Superiority of the RL controller is an empirical outcome of the fresh comparison, not a completion criterion for the software.

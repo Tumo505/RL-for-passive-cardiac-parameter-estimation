@@ -185,6 +185,7 @@ def train(config, data_dir, output, seed=0, device="auto", steps=None, resume=Fa
     save_json(metadata_path, metadata)
     deadline = time.monotonic()+max_seconds if max_seconds is not None else None
     callback = ValidationCallback(config, mechanics, validation_cases, tasks, directory, stop, deadline)
+    callback.init_callback(model)
     # In timed mode a sentinel horizon lets the callback end training by elapsed
     # time. Constant SAC learning rates do not depend on this horizon.
     target = int(steps if steps is not None else (2**53 if max_seconds is not None else settings["timesteps"]))

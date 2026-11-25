@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def prepare(config, directory):
         load_cases(config, directory, "train")
         return model
     # Split parameter cases before noise/masking augmentation; no noisy copies leak.
+    generation_start = time.perf_counter()
     counts = [config["data"][key] for key in ("train_cases", "validation_cases", "test_cases")]
     z = qmc.LatinHypercube(2, seed=config["seed"]).random(sum(counts))
     clean = np.asarray([model.reference(row) for row in z])
@@ -64,8 +66,10 @@ def prepare(config, directory):
     temporary.replace(path)
     save_json(directory / "cases.json", {
         "fingerprint": dataset_fingerprint(config), "counts": dict(zip(("train", "validation", "test"), counts)),
+        "sampling_seed": config["seed"],
         "reference_parameter_evaluations": sum(counts),
         "equilibrium_solves": sum(counts) * len(model.loads),
+        "generation_seconds": time.perf_counter()-generation_start,
         "truth_backend": "reference", "split_unit": "material parameter pair",
         "noise_definition": "Gaussian sigma = noise_level * 0.25 * length_mm",
         "missingness": "Uniform random displacement components; mask fixed per episode",

@@ -41,7 +41,9 @@ from pathlib import Path
 root, start, count, job = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 for seed in range(start, start+count):
     directory = root / f"seed_{seed}"
-    json.loads((directory / "run.json").read_text())
+    metadata = json.loads((directory / "run.json").read_text())
+    if metadata.get("experiment") == "hybrid_v2":
+        raise RuntimeError("Hybrid training has validation-based stopping. Use the hybrid evaluation workflow, not this legacy handoff script.")
     json.loads((directory / "best.json").read_text())
     with zipfile.ZipFile(directory / "best.zip") as archive:
         if archive.testzip() is not None:
