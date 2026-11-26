@@ -25,6 +25,7 @@ def main():
             sub.add_argument("--steps", type=int)
             sub.add_argument("--resume", action="store_true")
             sub.add_argument("--max-seconds", type=float)
+            sub.add_argument("--initializer-from", help="Share a compatible supervised initializer from another run directory")
         if command == "evaluate":
             sub.add_argument("--split", choices=("validation", "test"), default="validation")
             sub.add_argument("--confirm-test", action="store_true")
@@ -47,7 +48,7 @@ def main():
         print(f"Prepared fresh hybrid data in {args.data_dir}")
     elif args.command == "train":
         result = train_hybrid(config, args.data_dir, args.output, args.seed, args.device,
-                              args.steps, args.resume, args.max_seconds, args.threads)
+                              args.steps, args.resume, args.max_seconds, args.threads, args.initializer_from)
         print(json.dumps(result, indent=2))
         if result["status"] == "interrupted":
             raise SystemExit(75)

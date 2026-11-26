@@ -151,6 +151,11 @@ def test_hybrid_training_resume_and_validation_pipeline(tmp_path):
     test_output = evaluate_hybrid(config, data, run, methods=["mechanics_direct", "hybrid_sac"],
                                   split="test", confirm_test=True, limit=1)
     assert json.loads((test_output / "protocol.json").read_text())["split"] == "test"
+    polished_output = evaluate_hybrid(config, data, run, methods=["hybrid_sac_polish"],
+                                      split="validation", limit=1, overwrite=True)
+    with (polished_output / "results.csv").open() as handle:
+        polished = list(csv.DictReader(handle))
+    assert all(int(row["forward_calls"]) <= int(row["budget"]) for row in polished)
     (run / "best.zip").write_bytes((run / "best.zip").read_bytes()+b"changed")
     with pytest.raises(ValueError, match="artifacts changed"):
         evaluate_hybrid(config, data, run, split="test", confirm_test=True)

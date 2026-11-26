@@ -371,3 +371,73 @@ Do not use the legacy `finish-training.sh` handoff for hybrid runs. Hybrid train
 Useful artifacts include `initializer.pt`, `initializer.json`, `best.zip`, `best.json`, `early_stopping.json`, `frozen.json`, `run.json` and per-split results, traces, summaries, protocols and plots. Inference outcomes use the best deployable objective among evaluated candidates, never the smallest true parameter error seen during evaluation. Bootstrap uncertainty is over material cases and training seeds, keeping repeated observation conditions paired.
 
 The test set must remain unused while selecting reward weights, priors, network settings and stopping rules. If a learned initial estimate plus conventional LM matches RL, attribute the gain to learned initialisation/regularisation. Superiority of the RL controller is an empirical outcome of the fresh comparison, not a completion criterion for the software.
+
+## Accuracy-focused RL sweep
+
+This extension tests whether a lower per-call penalty and an optional final correction improve the controller's accuracy. It cannot guarantee an RL win. Earlier v1/v2 outputs remain in their original folders; the new defaults use `runs/hybrid_sweep` and `data/hybrid_sweep`. The material cases and observation seeds match the v2 design, including its still-unscored 300-case final test. Do not use this sweep to tune against any final-test results you have already inspected.
+
+Three profiles keep the mechanics, supervised initialiser, prior and SAC architecture fixed:
+
+| Profile | Per-call penalty | Purpose |
+|---|---:|---|
+| `efficient` | 0.002 | Controlled repeat of the previous cost preference |
+| `balanced` | 0.0002 | Reduce the incentive to stop early |
+| `accurate` | 0 | Optimise synthetic training parameter accuracy without a call penalty |
+
+The checkpoint validation panel increases from 72 to **288 observation tasks** (32 material cases per noise/missingness condition). The minimum meaningful improvement becomes `0.0001`, patience increases to 12 checks, and the finite one-million-transition ceiling remains. The full selection comparison uses all 128 validation material cases. Training truth remains confined to offline reward computation and validation scoring; inference never sees true parameters or true noise labels.
+
+Each trained profile evaluates three RL inference variants:
+
+- `hybrid_sac`: the controller's original stopping decision.
+- `hybrid_sac_polish`: append at most one conventional LM correction if three calls remain.
+- `hybrid_sac_noise_polish`: append that correction only when the noise estimated from measured displacements is at most `0.02` in normalised units.
+
+Polishing reuses the cached selected prediction, costs at most three additional predictions, uses the same prior and objective, and stays within the original total budget. It is an explicit hybrid method; attribute its gains separately from RL alone. Results record policy calls, polishing calls, the polishing rule and stop reason.
+
+Two additional fixed comparators, `neural_noise_lm` and `neural_noise_lsq`, use the same learned initialiser and MAP prior with a measured-noise discrepancy stopping rule: squared measured residual norm divided by estimated variance is at most `observed_components - 2`. Since variance is estimated from spatial residuals, this is a heuristic, not an exact statistical confidence test. No simulator noise label or true parameter error enters that rule. These controls test whether a simple conventional stopping rule explains the controller's efficiency.
+
+The initialiser is fitted **once per seed**, then copied byte-for-byte into the other profiles. Compatibility checks cover the data, seed, feature/physics implementation and initialiser hyperparameters. Reused copies record zero new fitting time and retain the shared fitting cost in `initializer.json`. Include the shared fit once and **all three profiles' RL training and validation costs** when reporting the cost of this search. A selected policy's own training time alone understates the development cost.
+
+### Submit and monitor
+
+Keep the existing tested environment; no dependency upgrade is needed. From the project directory on the PBS submission host:
+
+```bash
+mkdir -p logs
+qsub -q YOUR_GPU_QUEUE -l software=YOUR_SITE_RESOURCE \
+  -o "logs/accuracy_sweep_$(date +%Y%m%d_%H%M%S).log" \
+  scripts/hpc/accuracy-sweep.pbs
+```
+
+The job requests **168 hours, one exclusive node, 28 CPUs, 240 GB RAM and four GPUs**. Four seeds run concurrently per profile, using all allocated CPU threads and scheduler-visible GPUs. The three profiles run sequentially. Validation stopping and the transition ceiling determine useful training duration; the job exits when work is complete. Memory is used on demand. There is no claim that this small, CPU-heavy model will saturate the GPUs or RAM.
+
+```bash
+qstat -u "$USER"
+.venv/bin/python -m cardiac_rl.sweep status
+```
+
+Per-profile logs are `logs/PROFILE_train_JOBID_seed_N.log` and `logs/PROFILE_evaluate_JOBID_seed_N.log`. The root `progress.json` identifies the active profile; its `phase.json` identifies training versus evaluation. Training ends before the larger reference-solver comparison, so an early-stopped worker can be followed by substantial evaluation work. Each profile writes **55,296 validation rows per seed**, or 221,184 across four seeds. Across three profiles the complete comparison has 663,552 rows. Aggregates stay within each profile folder.
+
+A repeated submission reuses completed compatible training and complete identical evaluations. Interrupted training resumes its saved checkpoint. An incomplete evaluation fails explicitly; recover that specific profile/seed with `cardiac_rl.hybrid_cli evaluate --overwrite` using its original configuration and directory before resubmitting. Do not update implementation files while a sweep is running: source hashes are part of the frozen experiment.
+
+### Freeze selection and open the final test
+
+After all profiles finish, `selection.json` records all nine RL candidates and nine fixed baselines at the prespecified **eight-call primary budget**. It selects the RL candidate with lowest pooled validation mean absolute log parameter error. Exact ties use fewer mean calls, then profile/method names. Baselines are always reported from the first profile, and their estimates/call counts must agree across profiles. The selector checks complete, unique condition coverage, hard budgets, shared initialisers, protocols and artifact hashes. It does not require RL to beat a baseline and does not select a favorable baseline.
+
+```bash
+cat runs/hybrid_sweep/selection.json
+```
+
+Once that validation choice is fixed, submit the separate final evaluation:
+
+```bash
+qsub -q YOUR_GPU_QUEUE -l software=YOUR_SITE_RESOURCE \
+  -o "logs/accuracy_test_$(date +%Y%m%d_%H%M%S).log" \
+  scripts/hpc/accuracy-test.pbs
+```
+
+This runs **one selected RL variant plus all nine fixed baselines**, on all 300 test cases, noise/missingness settings and four budgets: 108,000 records per seed. It does not retrain. A test receipt locks the selection, suite, source, configurations, selected artifacts and validation evidence; changed inputs are rejected. The sweep commands prevent reselection or retraining in that root after the test is opened. A repeated identical final-test submission may reuse complete outputs.
+
+Review paired test differences and uncertainty across material cases and training seeds. Accuracy superiority, success-rate superiority and efficiency at comparable accuracy are different claims. All must be supported by the fresh results. With four seeds, uncertainty about training variability remains substantial. If conventional methods are better, report that outcome and the conditions where RL is useful.
+
+`--local` on `cardiac_rl.sweep run` supports sequential validation pilots without PBS. It uses the suite's actual sizes, so use a separate small suite for software checks; `configs/hybrid_sweep.yaml` is the full experiment. The automated integration test runs an isolated tiny three-profile suite, tests every new method, and never scores the research final-test cases.

@@ -61,6 +61,8 @@ def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkey
     monkeypatch.setenv("PBS_JOBID", "123.example")
     monkeypatch.delenv("PBS_NP", raising=False)
     argv = ["allocation", "--output", str(root), "--workflow", workflow]
+    if workflow == "hybrid":
+        argv += ["--initializer-from", "shared", "--methods", "neural_lm", "hybrid_sac_polish", "--log-prefix", "accuracy"]
     if evaluate_only:
         argv.append("--evaluate-only")
         (root / "allocation.json").write_text("original training allocation")
@@ -106,12 +108,17 @@ def test_allocation_launches_timed_workers_then_full_evaluation(tmp_path, monkey
         assert command[command.index("--device")+1] == "cuda:0"
         assert environment["OMP_NUM_THREADS"] == "7"
         assert ("--resume" in command) == (index == 0)
+        if workflow == "hybrid":
+            assert command[command.index("--initializer-from")+1] == f"shared/seed_{index}"
     for command, _ in (launches if evaluate_only else launches[4:]):
         assert command[3] == "evaluate"
         assert command[command.index("--backend")+1] == "reference"
         if workflow == "hybrid":
             assert command[command.index("--split")+1] == "validation"
             assert "--confirm-test" not in command
+            assert command[command.index("--methods")+1:command.index("--methods")+3] == ["neural_lm", "hybrid_sac_polish"]
+    if workflow == "hybrid":
+        assert (tmp_path / "logs/accuracy_evaluate_123.example_seed_0.log").exists()
     assert len(aggregates) == 1
     if evaluate_only:
         assert (root / "allocation.json").read_text() == "original training allocation"

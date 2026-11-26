@@ -28,6 +28,8 @@ def configuration(path):
             raise ValueError(f"{name} must be positive")
     if settings["finite_difference_step"] >= 1 or settings["regularization_weight"] < 0:
         raise ValueError("Invalid finite-difference step or regularization weight")
+    if settings["call_penalty"] < 0 or settings.get("polish_noise_max", .02) <= 0 or settings.get("discrepancy_factor", 1.) <= 0:
+        raise ValueError("Call penalty must be nonnegative; noise/polishing thresholds must be positive")
     if not -1 < settings["stop_threshold"] < 1:
         raise ValueError("stop_threshold must be in (-1, 1)")
     if min(settings["training_budgets"]+config["evaluation"]["budgets"]) < 4:

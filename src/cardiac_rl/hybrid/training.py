@@ -18,7 +18,7 @@ from ..config import fingerprint, save_json
 from ..data import fixed_tasks, load_cases
 from ..training import restore_checkpoint, save_checkpoint
 from .environment import HybridEnv
-from .initializer import train_initializer
+from .initializer import train_initializer, reuse_initializer
 from .setup import prepare_hybrid, source_hash
 
 
@@ -99,7 +99,7 @@ class HybridCallback(BaseCallback):
 
 
 def train_hybrid(config, data_dir, output, seed=0, device="cpu", steps=None, resume=False,
-                 max_seconds=None, threads=None):
+                 max_seconds=None, threads=None, initializer_from=None):
     started, monotonic_start = time.perf_counter(), time.monotonic()
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("Requested CUDA device is unavailable")
@@ -120,6 +120,8 @@ def train_hybrid(config, data_dir, output, seed=0, device="cpu", steps=None, res
     elif resume:
         raise ValueError("Cannot resume a missing hybrid run")
     mechanics = prepare_hybrid(config, data_dir)
+    if initializer_from is not None:
+        reuse_initializer(initializer_from, directory, config, seed)
     initializer = train_initializer(config, data_dir, directory, mechanics, seed, device)
     cases = load_cases(config, data_dir, "train")
     val_cases = load_cases(config, data_dir, "validation")
@@ -149,7 +151,8 @@ def train_hybrid(config, data_dir, output, seed=0, device="cpu", steps=None, res
             handlers[sig] = signal.signal(sig, request_stop)
     implementation_hash = source_hash()
     initial_steps = agent.num_timesteps
-    metadata = {"experiment": "hybrid_v2", "seed": seed, "status": "running",
+    metadata = {"experiment": config["hybrid"].get("experiment_label", "hybrid_v2"), "seed": seed, "status": "running",
+                "initializer_reused": json.loads((directory / "initializer.json").read_text()).get("reused", False),
                 "config_fingerprint": fingerprint(config), "source_hash": implementation_hash,
                 "source_changed_on_resume": bool(previous and previous.get("source_hash") != implementation_hash),
                 "python": platform.python_version(), "torch": torch.__version__, "device": str(agent.device),

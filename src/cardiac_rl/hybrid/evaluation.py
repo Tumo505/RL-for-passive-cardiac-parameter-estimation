@@ -13,26 +13,36 @@ from stable_baselines3 import SAC
 from ..config import fingerprint, save_json
 from ..data import fixed_tasks, load_cases
 from ..evaluation import plot_results, summarise
-from .core import CalibrationOracle, converged_lm, converged_lsq, mechanics_inverse
+from .core import CalibrationOracle, converged_lm, converged_lsq, mechanics_inverse, polish_candidate
 from .environment import HybridEnv
 from .features import compress_measurements
 from .initializer import load_initializer
 from .setup import prepare_hybrid, source_hash
 
 
-METHODS = ("mechanics_direct", "lsq_midpoint", "neural_only", "neural_lsq", "map_lsq_midpoint",
+BASE_METHODS = ("mechanics_direct", "lsq_midpoint", "neural_only", "neural_lsq", "map_lsq_midpoint",
            "neural_map_lsq", "neural_lm", "hybrid_sac")
+ACCURACY_METHODS = BASE_METHODS + ("neural_noise_lm", "neural_noise_lsq", "hybrid_sac_polish", "hybrid_sac_noise_polish")
+METHODS = ACCURACY_METHODS
+
+
+def configured_methods(config):
+    return ACCURACY_METHODS if config["hybrid"].get("enable_accuracy_controls", False) else BASE_METHODS
 
 
 def solve(method, config, model, cases, initializer, policy, task, budget, backend):
     settings = config["hybrid"]
-    if method == "hybrid_sac":
+    if method.startswith("hybrid_sac"):
         env = HybridEnv(config, model, cases, initializer, training=False, backend=backend)
         observation, info = env.reset(options={"task": task, "budget": budget})
         while True:
             action, _ = policy.predict(observation, deterministic=True)
             observation, _, done, _, info = env.step(action)
             if done:
+                if method != "hybrid_sac":
+                    limit = settings.get("polish_noise_max", .02) if method == "hybrid_sac_noise_polish" else None
+                    estimate, reason = polish_candidate(env.oracle, settings, limit)
+                    return estimate, env.oracle, info["stop_reason"]+"+"+reason
                 return env.oracle.best_z.copy(), env.oracle, info["stop_reason"]
     measurement = compress_measurements(model, task.observed, task.mask, settings["noise_floor"])
     if method == "mechanics_direct":
@@ -42,7 +52,7 @@ def solve(method, config, model, cases, initializer, policy, task, budget, backe
         return initial, oracle, "direct_stress_space_fit"
     learned = method != "lsq_midpoint"
     initial = initializer.predict(measurement.features) if learned else np.array([.5, .5])
-    regularization = settings["regularization_weight"] if method in ("map_lsq_midpoint", "neural_map_lsq", "neural_lm") else 0.
+    regularization = settings["regularization_weight"] if method in ("map_lsq_midpoint", "neural_map_lsq", "neural_lm", "neural_noise_lm", "neural_noise_lsq") else 0.
     oracle = CalibrationOracle(model, task, budget, measurement.noise, initial,
                                initializer.prior_std, regularization, backend)
     if method in ("lsq_midpoint", "map_lsq_midpoint"):
@@ -52,13 +62,13 @@ def solve(method, config, model, cases, initializer, policy, task, budget, backe
     if method == "neural_only":
         oracle.evaluate(initial)
         return initial, oracle, "direct_prediction"
-    if method == "neural_lm":
-        result = converged_lm(oracle, start, settings)
-    elif method in ("lsq_midpoint", "neural_lsq", "map_lsq_midpoint", "neural_map_lsq"):
-        result = converged_lsq(oracle, start, settings)
+    if method in ("neural_lm", "neural_noise_lm"):
+        result = converged_lm(oracle, start, settings, noise_stop=method == "neural_noise_lm")
+    elif method in ("lsq_midpoint", "neural_lsq", "map_lsq_midpoint", "neural_map_lsq", "neural_noise_lsq"):
+        result = converged_lsq(oracle, start, settings, noise_stop=method == "neural_noise_lsq")
     else:
         raise ValueError(f"Unknown hybrid comparator: {method}")
-    return result, oracle, "budget_or_convergence"
+    return result, oracle, "noise_discrepancy" if oracle.diagnostics.get("noise_stopped") else "budget_or_convergence"
 
 
 def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confirm_test=False,
@@ -80,7 +90,7 @@ def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confir
     for name, field in (("best.zip", "policy_sha256"), ("initializer.pt", "initializer_sha256")):
         if hashlib.sha256((directory / name).read_bytes()).hexdigest() != frozen[field]:
             raise ValueError("Selected artifacts changed after validation selection; freeze them through training first")
-    methods = list(methods or METHODS)
+    methods = list(methods or configured_methods(config))
     if not methods or len(set(methods)) != len(methods) or any(method not in METHODS for method in methods):
         raise ValueError(f"Choose unique methods from {METHODS}")
     destination = directory / f"evaluation_{split}_{backend}"
@@ -105,7 +115,7 @@ def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confir
     cases = load_cases(config, data_dir, split)
     tasks = list(fixed_tasks(config, data_dir, split, limit))
     initializer = load_initializer(directory / "initializer.pt", config, seed)
-    policy = SAC.load(directory / "best.zip", device="cpu") if "hybrid_sac" in methods else None
+    policy = SAC.load(directory / "best.zip", device="cpu") if any(m.startswith("hybrid_sac") for m in methods) else None
     rows = []
     started = time.perf_counter()
     with (destination / "traces.jsonl").open("w") as trace_file:
@@ -133,6 +143,9 @@ def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confir
                            "observed_fraction": task.fraction, "budget": budget, "method": method,
                            "backend": backend, "split": split, "forward_calls": oracle.calls,
                            "online_seconds": seconds, "stop_reason": reason,
+                           "policy_forward_calls": oracle.diagnostics.get("policy_forward_calls", oracle.calls if method.startswith("hybrid_sac") else 0),
+                           "polishing_forward_calls": oracle.diagnostics.get("polishing_forward_calls", 0),
+                           "polishing_rule": oracle.diagnostics.get("polishing_reason", "none"),
                            "objective_kind": ("stress_space_direct_audit" if method == "mechanics_direct" else
                                               ("empirical_map" if oracle.regularization else "mle")),
                            "a_true_kpa": float(truth[0]), "af_true_kpa": float(truth[1]),
@@ -157,7 +170,7 @@ def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confir
         writer.writeheader()
         writer.writerows(rows)
     save_json(destination / "summary.json", summarise(rows))
-    save_json(destination / "protocol.json", {"experiment": "hybrid_v2", "split": split,
+    save_json(destination / "protocol.json", {"experiment": config["hybrid"].get("experiment_label", "hybrid_v2"), "split": split,
         "source_hash": frozen["source_hash"],
         "config_fingerprint": fingerprint(config), "seed": seed, "backend": backend, "methods": methods,
         "unique_parameter_cases": len({task.case_id for task in tasks}), "observation_tasks": len(tasks),
@@ -167,6 +180,9 @@ def evaluate_hybrid(config, data_dir, output, seed=0, split="validation", confir
         "budget_unit": "One actual complete forward prediction; FD probes counted; exact-repeat cache available to all methods",
         "first_success": "Post-hoc truth-based diagnostic, never used for stopping or selection",
         "selection": "Best deployable MLE or MAP objective, never oracle parameter error",
+        "discrepancy_rule": "Measured residual norm squared / estimated sigma squared <= factor*(observed components-2)",
+        "discrepancy_factor": config["hybrid"].get("discrepancy_factor", 1.),
+        "conditional_polish_noise_max": config["hybrid"].get("polish_noise_max", .02),
         "initialization_in_timing": True, "posthoc_reference_audit_calls": len(rows),
         "online_device": "CPU for every method; offline initializer and SAC devices recorded separately",
         "policy_sha256": frozen["policy_sha256"], "initializer_sha256": frozen["initializer_sha256"]})

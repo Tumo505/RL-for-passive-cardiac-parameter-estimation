@@ -51,6 +51,7 @@ class CalibrationOracle:
         if self.budget < 1 or self.noise <= 0 or np.any(self.prior_std <= 0):
             raise ValueError("Invalid oracle budget/noise/prior scale")
         self.calls, self.cache, self.trace = 0, {}, []
+        self.diagnostics = {}
         self.best_cost, self.best_z = float("inf"), None
         self.start = time.perf_counter()
 
@@ -122,10 +123,43 @@ class LMStepper:
                 "accepted": self.last_accepted}
 
 
-def converged_lm(oracle, initial, settings):
+def discrepancy_met(oracle, factor=1.):
+    """Deployment-available noise rule, not an oracle parameter-accuracy test.
+
+    Noise is estimated from spatial residuals, so this is a discrepancy heuristic
+    rather than an exact chi-square confidence test. Use the selected candidate's
+    cached prediction; no uncounted forward query is performed.
+    """
+    if oracle.best_z is None:
+        return False
+    prediction = oracle.cache[tuple(oracle.best_z)][0]
+    residual = (prediction[oracle.task.mask]-oracle.task.observed[oracle.task.mask])/oracle.noise
+    return bool(residual @ residual <= factor*max(int(oracle.task.mask.sum())-2, 1))
+
+
+def polish_candidate(oracle, settings, noise_limit=None):
+    """At most one extra LM correction, using the SAME oracle and call budget."""
+    before = oracle.calls
+    if oracle.remaining < 3:
+        reason = "insufficient_budget"
+    elif noise_limit is not None and oracle.noise > noise_limit:
+        reason = "estimated_noise_above_limit"
+    else:
+        stepper = LMStepper(oracle, oracle.best_z.copy(), settings["finite_difference_step"])
+        stepper.step(.01, 1.)
+        reason = "polished"
+    oracle.diagnostics.update(policy_forward_calls=before, polishing_forward_calls=oracle.calls-before,
+                              polishing_reason=reason)
+    return oracle.best_z.copy(), reason
+
+
+def converged_lm(oracle, initial, settings, noise_stop=False):
     stepper = LMStepper(oracle, initial, settings["finite_difference_step"])
     damping = .01
     while oracle.remaining >= 3:
+        if noise_stop and discrepancy_met(oracle, settings.get("discrepancy_factor", 1.)):
+            oracle.diagnostics["noise_stopped"] = True
+            break
         calls = oracle.calls
         metrics = stepper.step(damping, 1.)
         if (oracle.calls == calls or metrics["gradient_norm"] <= settings["gradient_tolerance"] or
@@ -136,15 +170,21 @@ def converged_lm(oracle, initial, settings):
     return oracle.best_z.copy()
 
 
-def converged_lsq(oracle, initial, settings):
+def converged_lsq(oracle, initial, settings, noise_stop=False):
     """Single convergence-aware solve; no artificial budget-filling restarts."""
     oracle.evaluate(initial)
+    class NoiseStop(Exception):
+        pass
     def residual(z):
-        return oracle.evaluate(z)[1]
+        result = oracle.evaluate(z)[1]
+        if noise_stop and discrepancy_met(oracle, settings.get("discrepancy_factor", 1.)):
+            oracle.diagnostics["noise_stopped"] = True
+            raise NoiseStop
+        return result
     try:
         least_squares(residual, initial, bounds=([0., 0.], [1., 1.]), jac="2-point",
                       xtol=settings["step_tolerance"], ftol=settings["cost_tolerance"],
                       gtol=settings["gradient_tolerance"])
-    except BudgetExhausted:
+    except (BudgetExhausted, NoiseStop):
         pass
     return oracle.best_z.copy()

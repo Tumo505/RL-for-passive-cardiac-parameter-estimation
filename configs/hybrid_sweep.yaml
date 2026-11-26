@@ -1,0 +1,7 @@
+profiles:
+  efficient: configs/hybrid_efficient.yaml
+  balanced: configs/hybrid_balanced.yaml
+  accurate: configs/hybrid_accurate.yaml
+seeds: 4
+seed_start: 0
+primary_budget: 8

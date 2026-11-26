@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +13,45 @@ from torch import nn
 from ..config import fingerprint, save_json
 from ..data import fixed_tasks, load_cases, make_task
 from .features import compress_measurements
+
+
+def initializer_fingerprint(config):
+    settings = config["hybrid"]
+    keys = ("noise_floor", "prior_std_floor", "initializer_samples", "initializer_epochs",
+            "initializer_patience", "initializer_batch_size", "initializer_hidden_sizes")
+    directory = Path(__file__).parent
+    implementation = b"".join(path.read_bytes() for path in
+        [directory/"initializer.py", directory/"features.py", directory.parent/"mechanics.py", directory.parent/"data.py"])
+    return fingerprint({"seed": config["seed"], "mechanics": config["mechanics"], "data": config["data"],
+                        "settings": {key: settings[key] for key in keys},
+                        "implementation": hashlib.sha256(implementation).hexdigest()})
+
+
+def compatible(payload, config, seed):
+    signature = payload.get("initializer_fingerprint")
+    return payload["seed"] == seed and (
+        signature == initializer_fingerprint(config) if signature is not None
+        else payload["config_fingerprint"] == fingerprint(config))
+
+
+def reuse_initializer(source, directory, config, seed):
+    """Share identical supervised weights across penalty variants; audit cost once."""
+    source, directory = Path(source), Path(directory)
+    payload = torch.load(source / "initializer.pt", map_location="cpu", weights_only=True)
+    if not compatible(payload, config, seed):
+        raise ValueError("Shared initializer has different data, feature encoder, hyperparameters or seed")
+    target = directory / "initializer.pt"
+    if target.exists():
+        if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256((source/"initializer.pt").read_bytes()).digest():
+            raise ValueError("Run already contains a different initializer; it will not be overwritten")
+    else:
+        directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "initializer.pt", target.with_suffix(".pending.pt"))
+        target.with_suffix(".pending.pt").replace(target)
+    info = json.loads((source / "initializer.json").read_text())
+    info.update(reused=True, shared_from=str(source), shared_training_seconds=info.get("shared_training_seconds", info["training_seconds"]),
+                training_seconds=0., initializer_fingerprint=initializer_fingerprint(config))
+    save_json(directory / "initializer.json", info)
 
 
 class Initializer(nn.Module):
@@ -44,7 +86,7 @@ class Predictor:
 
 def load_initializer(path, config, seed, device="cpu"):
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload["config_fingerprint"] != fingerprint(config) or payload["seed"] != seed:
+    if not compatible(payload, config, seed):
         raise ValueError("Initializer/configuration/seed mismatch")
     return Predictor(payload, device)
 
@@ -104,10 +146,12 @@ def train_initializer(config, data_dir, directory, model, seed, device="cpu"):
     prior_std = np.maximum(np.sqrt(np.mean(errors**2, axis=0)), settings["prior_std_floor"])
     payload = {"state_dict": best_state, "inputs": int(x.shape[1]), "hidden_sizes": settings["initializer_hidden_sizes"],
                "mean": mean.tolist(), "scale": scale.tolist(), "prior_std": prior_std.tolist(),
-               "seed": seed, "config_fingerprint": fingerprint(config)}
+               "seed": seed, "config_fingerprint": fingerprint(config),
+               "initializer_fingerprint": initializer_fingerprint(config)}
     torch.save(payload, path.with_suffix(".pending.pt"))
     path.with_suffix(".pending.pt").replace(path)
     save_json(directory / "initializer.json", {"training_seconds": time.perf_counter()-start,
+        "initializer_fingerprint": initializer_fingerprint(config), "reused": False,
         "device": device, "training_examples": len(x), "validation_examples": len(tasks),
         "unique_training_material_cases": len(z), "additional_forward_calls": 0,
         "prior_std_log_unit_coordinates": prior_std.tolist(), "validation_mse": history,

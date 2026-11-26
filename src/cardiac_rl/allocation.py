@@ -76,7 +76,13 @@ def main():
     parser.add_argument("--workflow", choices=("legacy", "hybrid"), default="legacy")
     parser.add_argument("--evaluation-split", choices=("validation", "test"), default="validation")
     parser.add_argument("--confirm-test", action="store_true")
+    parser.add_argument("--initializer-from", help="Root containing compatible seed_N initializers")
+    parser.add_argument("--methods", nargs="+")
+    parser.add_argument("--log-prefix", default="")
+    parser.add_argument("--skip-completed-training", action="store_true")
     args = parser.parse_args()
+    if args.log_prefix and not re.fullmatch(r"[a-zA-Z0-9_-]+", args.log_prefix):
+        parser.error("Log prefix must contain only letters, numbers, underscores or hyphens")
     if args.workflow == "hybrid" and args.evaluation_split == "test" and not args.confirm_test:
         parser.error("Freeze hybrid configuration and pass --confirm-test for the fresh final test")
     job_id = os.environ.get("PBS_JOBID")
@@ -150,17 +156,29 @@ def main():
         signal.signal(signum, stop_children)
 
     def run_phase(phase):
+        save_json(root / "phase.json", {"phase": phase, "job_id": job_id, "log_prefix": args.log_prefix})
         children.clear()
         handles = []
         try:
             for worker in plan:
                 seed = args.seed_start+worker["slot"]
                 directory = root / f"seed_{seed}"
+                if phase == "train" and args.skip_completed_training and (directory / "run.json").exists():
+                    prior = json.loads((directory / "run.json").read_text())
+                    from .config import fingerprint
+                    from .hybrid.setup import source_hash
+                    if (args.workflow == "hybrid" and prior.get("status") in ("completed", "validation_early_stopping")
+                            and prior.get("source_hash") == source_hash() and prior.get("config_fingerprint") == fingerprint(config)
+                            and prior.get("seed") == seed and (directory / "frozen.json").exists()):
+                        print(f"Reusing completed training seed={seed}", flush=True)
+                        continue
                 module = "cardiac_rl.hybrid_cli" if args.workflow == "hybrid" else "cardiac_rl.cli"
                 command = [sys.executable, "-m", module, phase, "--config", args.config,
                            "--data-dir", args.data_dir, "--output", str(directory), "--seed", str(seed),
                            "--threads", str(worker["threads"])]
                 if phase == "train":
+                    if args.initializer_from:
+                        command += ["--initializer-from", str(Path(args.initializer_from) / f"seed_{seed}")]
                     seconds = deadline-time.monotonic()-reserve-grace
                     if seconds <= 0:
                         raise RuntimeError("No training time remains before final evaluation")
@@ -168,6 +186,8 @@ def main():
                     if (directory / "run.json").exists():
                         command.append("--resume")
                 else:
+                    if args.methods:
+                        command += ["--methods", *args.methods]
                     command += ["--backend", "reference", "--direct-device", worker["device"]]
                     if args.workflow == "hybrid":
                         command += ["--split", args.evaluation_split]
@@ -177,7 +197,8 @@ def main():
                 for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
                     environment[name] = str(worker["threads"])
                 environment["MPLCONFIGDIR"] = str((logs / f"mpl_seed_{seed}").resolve())
-                path = logs / f"{phase}_{job_id}_seed_{seed}.log"
+                prefix = args.log_prefix+"_" if args.log_prefix else ""
+                path = logs / f"{prefix}{phase}_{job_id}_seed_{seed}.log"
                 handle = path.open("a")
                 handles.append(handle)
                 print(f"{phase} seed={seed} device={worker['device']} cpu_threads={worker['threads']} log={path}", flush=True)
@@ -209,6 +230,7 @@ def main():
         run_phase("train")
     run_phase("evaluate")
     aggregate(root, root / "aggregate.json")
+    save_json(root / "phase.json", {"phase": "complete", "job_id": job_id, "log_prefix": args.log_prefix})
     print(f"Completed full reference comparison: {root / 'aggregate.json'}", flush=True)
 
 

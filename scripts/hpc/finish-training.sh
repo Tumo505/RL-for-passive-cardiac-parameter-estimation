@@ -42,7 +42,7 @@ root, start, count, job = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]),
 for seed in range(start, start+count):
     directory = root / f"seed_{seed}"
     metadata = json.loads((directory / "run.json").read_text())
-    if metadata.get("experiment") == "hybrid_v2":
+    if metadata.get("experiment", "").startswith("hybrid_v"):
         raise RuntimeError("Hybrid training has validation-based stopping. Use the hybrid evaluation workflow, not this legacy handoff script.")
     json.loads((directory / "best.json").read_text())
     with zipfile.ZipFile(directory / "best.zip") as archive:
